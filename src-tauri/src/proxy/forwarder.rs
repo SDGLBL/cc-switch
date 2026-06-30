@@ -472,7 +472,7 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model)) => {
+                Ok((response, claude_api_format, outbound_model, effective_provider)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -518,7 +518,7 @@ impl RequestForwarder {
 
                     return Ok(ForwardResult {
                         response,
-                        provider: provider.clone(),
+                        provider: effective_provider,
                         claude_api_format,
                         outbound_model,
                         connection_guard: None,
@@ -571,7 +571,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    effective_provider,
+                                )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -621,7 +626,7 @@ impl RequestForwarder {
 
                                     return Ok(ForwardResult {
                                         response,
-                                        provider: provider.clone(),
+                                        provider: effective_provider,
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
@@ -717,7 +722,12 @@ impl RequestForwarder {
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model)) => {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        effective_provider,
+                                    )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -770,7 +780,7 @@ impl RequestForwarder {
 
                                         return Ok(ForwardResult {
                                             response,
-                                            provider: provider.clone(),
+                                            provider: effective_provider,
                                             claude_api_format,
                                             outbound_model,
                                             connection_guard: None,
@@ -883,7 +893,12 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    effective_provider,
+                                )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -930,7 +945,7 @@ impl RequestForwarder {
 
                                     return Ok(ForwardResult {
                                         response,
-                                        provider: provider.clone(),
+                                        provider: effective_provider,
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
@@ -1091,8 +1106,10 @@ impl RequestForwarder {
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
+    /// 成功时返回 `(response, claude_api_format, outbound_model, effective_provider)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
+    /// `effective_provider` 是实际用于上游请求的 provider，Codex ModelHub 这类
+    /// 请求级 overlay 需要把 api_format 带回 handler 做响应转换。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
@@ -1104,15 +1121,9 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>, Provider), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
-
-        let is_full_url = provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.is_full_url)
-            .unwrap_or(false);
 
         // GitHub Copilot API 使用 /chat/completions（无 /v1 前缀）
         let is_copilot = provider
@@ -1248,6 +1259,24 @@ impl RequestForwarder {
         } else {
             None
         };
+
+        // Codex can keep one local Responses endpoint while selected providers
+        // expose request-specific upstream settings through a temporary overlay.
+        let effective_provider = if matches!(app_type, AppType::Codex) {
+            super::providers::modelhub_codex::overlay_provider_for_request(provider, body)
+        } else {
+            None
+        };
+        let provider = effective_provider.as_ref().unwrap_or(provider);
+        if effective_provider.is_some() {
+            super::providers::modelhub_codex::preserve_request_model(body, &mut mapped_body);
+            base_url = adapter.extract_base_url(provider)?;
+        }
+        let is_full_url = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.is_full_url)
+            .unwrap_or(false);
 
         // GitHub Copilot 动态 endpoint 路由
         // 从 CopilotAuthManager 获取缓存的 API endpoint（支持企业版等非默认 endpoint）
@@ -1963,7 +1992,12 @@ impl RequestForwarder {
             let response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
-            Ok((response, resolved_claude_api_format, outbound_model))
+            Ok((
+                response,
+                resolved_claude_api_format,
+                outbound_model,
+                provider.clone(),
+            ))
         } else {
             let status_code = status.as_u16();
             // 错误响应同样可能被上游压缩（content-encoding）。reqwest 未启用任何
@@ -3354,6 +3388,55 @@ mod tests {
 
         assert_eq!(endpoint, "/chat/completions?foo=bar");
         assert_eq!(passthrough_query.as_deref(), Some("foo=bar"));
+    }
+
+    #[test]
+    fn modelhub_codex_responses_route_inherits_incoming_query() {
+        let provider = test_provider_with_type(Some("modelhub_codex"));
+        let overlay = crate::proxy::providers::modelhub_codex::overlay_provider_for_request(
+            &provider,
+            &json!({ "model": "gpt-5.5-codex" }),
+        )
+        .expect("modelhub overlay");
+        let base_url = overlay
+            .settings_config
+            .get("base_url")
+            .and_then(|value| value.as_str())
+            .expect("overlay base_url");
+        let (_path, passthrough_query) =
+            split_endpoint_and_query("/v1/responses?ak=test-ak&api-version=2025-04-01-preview");
+
+        let url = append_query_to_full_url(base_url, passthrough_query);
+
+        assert_eq!(
+            url,
+            "https://aidp.bytedance.net/api/modelhub/online/responses?ak=test-ak&api-version=2025-04-01-preview"
+        );
+    }
+
+    #[test]
+    fn modelhub_codex_crawl_route_inherits_incoming_query() {
+        let provider = test_provider_with_type(Some("modelhub_codex"));
+        let overlay = crate::proxy::providers::modelhub_codex::overlay_provider_for_request(
+            &provider,
+            &json!({ "model": "glm-5.2" }),
+        )
+        .expect("modelhub overlay");
+        let base_url = overlay
+            .settings_config
+            .get("base_url")
+            .and_then(|value| value.as_str())
+            .expect("overlay base_url");
+        let (_endpoint, passthrough_query) = rewrite_codex_responses_endpoint_to_chat(
+            "/v1/responses?ak=test-ak&api-version=2025-04-01-preview",
+        );
+
+        let url = append_query_to_full_url(base_url, passthrough_query.as_deref());
+
+        assert_eq!(
+            url,
+            "https://aidp.bytedance.net/api/modelhub/online/v2/crawl?ak=test-ak&api-version=2025-04-01-preview"
+        );
     }
 
     #[test]
