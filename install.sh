@@ -62,7 +62,14 @@ detect_platform() {
   esac
 
   case "$arch" in
-    x86_64|amd64) arch_part="x86_64" ;;
+    x86_64|amd64)
+      if [ "$os_part" = "darwin" ]; then
+        echo "macOS x86_64 is not published for this ModelHub proxy release." >&2
+        echo "Use an Apple Silicon Mac, Linux build, or build cc-switch-modelhub-proxy from source." >&2
+        exit 1
+      fi
+      arch_part="x86_64"
+      ;;
     arm64|aarch64) arch_part="aarch64" ;;
     *)
       echo "Unsupported architecture: $arch" >&2
