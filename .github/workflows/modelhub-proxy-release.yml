@@ -1,0 +1,210 @@
+name: ModelHub Proxy Release
+
+on:
+  push:
+    tags:
+      - 'modelhub-proxy-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example modelhub-proxy-v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: modelhub-proxy-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  BIN_NAME: cc-switch-modelhub-proxy
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            modelhub-proxy-v*) ;;
+            *)
+              echo "Release tag must start with modelhub-proxy-v, got: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: modelhub-proxy-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml') }}
+          restore-keys: |
+            modelhub-proxy-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+            modelhub-proxy-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libssl-dev \
+            pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
+          sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
+            || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
+
+      - name: Build proxy binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build \
+            --manifest-path src-tauri/Cargo.toml \
+            --release \
+            --bin "$BIN_NAME" \
+            --target "${{ matrix.target }}"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_dir="src-tauri/target/${{ matrix.target }}/release"
+          binary="$target_dir/$BIN_NAME"
+          if [ ! -x "$binary" ]; then
+            echo "Missing built binary: $binary" >&2
+            exit 1
+          fi
+
+          package_dir="dist/package"
+          mkdir -p "$package_dir"
+          cp "$binary" "$package_dir/$BIN_NAME"
+          chmod 0755 "$package_dir/$BIN_NAME"
+          cat > "$package_dir/README.txt" <<EOF
+          $BIN_NAME
+
+          Build: $RELEASE_TAG
+          Platform: ${{ matrix.platform }}
+
+          Run:
+            $BIN_NAME setup-provider
+            $BIN_NAME serve
+
+          Codex config.toml must be configured separately to point at the local /v1 proxy.
+          EOF
+
+          asset="$BIN_NAME-$RELEASE_TAG-${{ matrix.platform }}.tar.gz"
+          mkdir -p dist
+          tar -C "$package_dir" -czf "dist/$asset" .
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "$asset" > "$asset.sha256")
+          else
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          fi
+          ls -lh "dist/$asset" "dist/$asset.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: modelhub-proxy-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            modelhub-proxy-v*) ;;
+            *)
+              echo "Release tag must start with modelhub-proxy-v, got: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: modelhub-proxy-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Add installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp install.sh release-assets/install.sh
+          chmod 0755 release-assets/install.sh
+          ls -lh release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            ModelHub proxy harness release for Codex -> cc-switch -> ModelHub routing.
+
+            Install:
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/install.sh | TAG=${{ env.RELEASE_TAG }} bash
+            ```
+
+            Or install from a checked-out repository:
+            ```bash
+            ./install.sh ${{ env.RELEASE_TAG }}
+            ```
+          files: release-assets/*
